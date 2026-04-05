@@ -88,12 +88,15 @@ const CONTENT_LOOKUP_STATUSES = ["publish", "draft", "private", "pending", "futu
 
 /**
  * テーマの目次などが ol + CSS カウンターを使っていると、本文の番号付きリストが連番で続くことがある。
+ * 加えて、テーマ側で list-style-position: inside; が指定されていると loose list の番号が
+ * 改行されたように見えるため、本文用の余白と outside 指定もここで補う。
  * marked の list レンダラーを差し替えると内部実装と不整合で落ちることがあるため、パース後に ol だけ置換する。
  */
 function annotateOrderedListsHtml(html: string): string {
+  const inlineStyle = "contain: style; list-style-position: outside; padding-inline-start: 1.5em; padding-left: 1.5em;";
   return html.replace(/<ol(\s+start="(\d+)")?>/g, (_, __, startNum: string | undefined) => {
     const n = startNum ?? "1";
-    return `<ol class="mdtowp-ol" start="${n}" style="contain: style;">`;
+    return `<ol class="mdtowp-ol" start="${n}" style="${inlineStyle}">`;
   });
 }
 
