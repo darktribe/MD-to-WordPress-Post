@@ -85,6 +85,8 @@ const GOLDBLOG_METADESC_META_KEY = "fit_seo_description-single";
 
 /** `status=any` は権限によって REST で拒否されるため、許可されやすい単一ステータスを順に試す */
 const CONTENT_LOOKUP_STATUSES = ["publish", "draft", "private", "pending", "future"] as const;
+const LOOKUP_RETRY_DELAYS_MS = [300, 1000] as const;
+const LOOKUP_RETRY_STATUS_CODES = new Set([401, 403, 408, 425, 429, 500, 502, 503, 504]);
 
 /**
  * テーマの目次などが ol + CSS カウンターを使っていると、本文の番号付きリストが連番で続くことがある。
@@ -501,9 +503,7 @@ async function findContentIdBySlug(
 ): Promise<number | null> {
   for (const postStatus of CONTENT_LOOKUP_STATUSES) {
     const url = `${target.apiUrl}?slug=${encodeURIComponent(slug)}&status=${encodeURIComponent(postStatus)}&per_page=1&_fields=id,type`;
-    const response = await fetch(url, {
-      headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
-    });
+    const response = await fetchLookupWithRetry(url, config);
     const text = await response.text();
     if (!response.ok) {
       if (isForbiddenStatusQueryError(response.status, text)) {
@@ -534,9 +534,7 @@ async function findPageParentIdBySlug(
 
   for (const pageStatus of CONTENT_LOOKUP_STATUSES) {
     const url = `${pageTarget.apiUrl}?slug=${encodeURIComponent(parentSlug)}&status=${encodeURIComponent(pageStatus)}&per_page=100&_fields=id,slug`;
-    const response = await fetch(url, {
-      headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
-    });
+    const response = await fetchLookupWithRetry(url, config);
     const text = await response.text();
     if (!response.ok) {
       if (isForbiddenStatusQueryError(response.status, text)) {
@@ -656,9 +654,7 @@ async function fetchPostMetaInEditContext(
   config: PublishConfig
 ): Promise<Record<string, unknown> | undefined> {
   const url = `${target.apiUrl}/${id}?context=edit&_fields=meta`;
-  const response = await fetch(url, {
-    headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
-  });
+  const response = await fetchLookupWithRetry(url, config);
   if (!response.ok) {
     return undefined;
   }
@@ -752,6 +748,39 @@ function basicAuth(username: string, appPassword: string): string {
 
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/+$/, "");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchLookupWithRetry(url: string, config: PublishConfig): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= LOOKUP_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const response = await fetch(url, {
+        headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
+      });
+
+      if (
+        response.ok ||
+        !LOOKUP_RETRY_STATUS_CODES.has(response.status) ||
+        attempt === LOOKUP_RETRY_DELAYS_MS.length
+      ) {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt === LOOKUP_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+    }
+
+    await delay(LOOKUP_RETRY_DELAYS_MS[attempt]);
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Lookup request failed.");
 }
 
 function inferTitle(content: string, fallback: string): string {
@@ -893,9 +922,7 @@ async function findCategoryIdsBySlugs(slugs: string[], config: PublishConfig): P
   }
 
   const url = `${stripTrailingSlash(config.siteUrl)}/wp-json/wp/v2/categories?slug=${encodeURIComponent(slugs.join(","))}&per_page=100&_fields=id,slug`;
-  const response = await fetch(url, {
-    headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
-  });
+  const response = await fetchLookupWithRetry(url, config);
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Category lookup failed (${response.status}): ${text}`);
@@ -926,9 +953,7 @@ async function findOrCreateTagIdByTerm(term: string, config: PublishConfig): Pro
 
   if (slug) {
     const findUrl = `${base}/wp-json/wp/v2/tags?slug=${encodeURIComponent(slug)}&per_page=1&_fields=id,name,slug`;
-    const findResponse = await fetch(findUrl, {
-      headers: { Authorization: basicAuth(config.username, config.applicationPassword) }
-    });
+    const findResponse = await fetchLookupWithRetry(findUrl, config);
     if (!findResponse.ok) {
       const text = await findResponse.text();
       throw new Error(`Tag lookup failed (${findResponse.status}): ${text}`);
