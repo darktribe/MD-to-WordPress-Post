@@ -1152,6 +1152,23 @@ async function renderInlineMarkdown(markdown: string): Promise<string> {
   return await marked.parseInline(markdown);
 }
 
+function encodeVisibleListContinuationWhitespace(whitespace: string): string {
+  return Array.from(whitespace)
+    .map(char => {
+      if (char === " ") {
+        return "&nbsp;";
+      }
+      if (char === "\t") {
+        return "&nbsp;&nbsp;&nbsp;&nbsp;";
+      }
+      if (char === "\u3000") {
+        return "&#x3000;";
+      }
+      return char;
+    })
+    .join("");
+}
+
 function normalizeListContinuationHardBreaks(markdown: string): string {
   const lines = markdown.split(/\r?\n/);
   const output: string[] = [];
@@ -1187,8 +1204,24 @@ function normalizeListContinuationHardBreaks(markdown: string): string {
       continue;
     }
 
-    const leadingSpaces = line.match(/^\s*/)?.[0].length ?? 0;
+    const leadingWhitespace = line.match(/^[\t \u3000]*/u)?.[0] ?? "";
+    const leadingSpaces = leadingWhitespace.length;
+    const lineContent = line.slice(leadingWhitespace.length);
+    const previousIndex = output.length - 1;
+    const previousHasHardBreak =
+      previousIndex >= 0 && /( {2,}|\\)$/.test(output[previousIndex]);
     if (leadingSpaces >= activeList.continuationIndent) {
+      if (previousHasHardBreak) {
+        const visibleWhitespace = encodeVisibleListContinuationWhitespace(
+          leadingWhitespace.slice(activeList.continuationIndent)
+        );
+        output.push(
+          `${" ".repeat(activeList.continuationIndent)}${visibleWhitespace}${lineContent}`
+        );
+        activeList.pendingBlankLine = false;
+        continue;
+      }
+
       activeList.pendingBlankLine = false;
       output.push(line);
       continue;
@@ -1200,12 +1233,12 @@ function normalizeListContinuationHardBreaks(markdown: string): string {
       continue;
     }
 
-    const previousIndex = output.length - 1;
-    if (previousIndex >= 0 && !/( {2,}|\\)$/.test(output[previousIndex])) {
+    if (!previousHasHardBreak) {
       output[previousIndex] = `${output[previousIndex]}  `;
     }
 
-    output.push(`${" ".repeat(activeList.continuationIndent)}${line.trimStart()}`);
+    const visibleWhitespace = encodeVisibleListContinuationWhitespace(leadingWhitespace);
+    output.push(`${" ".repeat(activeList.continuationIndent)}${visibleWhitespace}${lineContent}`);
     activeList.pendingBlankLine = false;
   }
 

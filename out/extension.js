@@ -902,6 +902,22 @@ function normalizeDefinitionListBody(line, isFirstDefinitionLine) {
 async function renderInlineMarkdown(markdown) {
     return await marked_1.marked.parseInline(markdown);
 }
+function encodeVisibleListContinuationWhitespace(whitespace) {
+    return Array.from(whitespace)
+        .map(char => {
+        if (char === " ") {
+            return "&nbsp;";
+        }
+        if (char === "\t") {
+            return "&nbsp;&nbsp;&nbsp;&nbsp;";
+        }
+        if (char === "\u3000") {
+            return "&#x3000;";
+        }
+        return char;
+    })
+        .join("");
+}
 function normalizeListContinuationHardBreaks(markdown) {
     const lines = markdown.split(/\r?\n/);
     const output = [];
@@ -934,8 +950,18 @@ function normalizeListContinuationHardBreaks(markdown) {
             output.push(line);
             continue;
         }
-        const leadingSpaces = line.match(/^\s*/)?.[0].length ?? 0;
+        const leadingWhitespace = line.match(/^[\t \u3000]*/u)?.[0] ?? "";
+        const leadingSpaces = leadingWhitespace.length;
+        const lineContent = line.slice(leadingWhitespace.length);
+        const previousIndex = output.length - 1;
+        const previousHasHardBreak = previousIndex >= 0 && /( {2,}|\\)$/.test(output[previousIndex]);
         if (leadingSpaces >= activeList.continuationIndent) {
+            if (previousHasHardBreak) {
+                const visibleWhitespace = encodeVisibleListContinuationWhitespace(leadingWhitespace.slice(activeList.continuationIndent));
+                output.push(`${" ".repeat(activeList.continuationIndent)}${visibleWhitespace}${lineContent}`);
+                activeList.pendingBlankLine = false;
+                continue;
+            }
             activeList.pendingBlankLine = false;
             output.push(line);
             continue;
@@ -945,11 +971,11 @@ function normalizeListContinuationHardBreaks(markdown) {
             output.push(line);
             continue;
         }
-        const previousIndex = output.length - 1;
-        if (previousIndex >= 0 && !/( {2,}|\\)$/.test(output[previousIndex])) {
+        if (!previousHasHardBreak) {
             output[previousIndex] = `${output[previousIndex]}  `;
         }
-        output.push(`${" ".repeat(activeList.continuationIndent)}${line.trimStart()}`);
+        const visibleWhitespace = encodeVisibleListContinuationWhitespace(leadingWhitespace);
+        output.push(`${" ".repeat(activeList.continuationIndent)}${visibleWhitespace}${lineContent}`);
         activeList.pendingBlankLine = false;
     }
     return output.join("\n");
