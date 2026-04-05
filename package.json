@@ -1,0 +1,94 @@
+{
+  "name": "md-to-wordpress-post",
+  "displayName": "Markdown to WordPress Post",
+  "description": "Publish Markdown files with local media assets to WordPress from Cursor.",
+  "version": "1.6.6",
+  "publisher": "show-ya",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/show-ya/VSIX-MD-to-WordPressPost.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:mdToWp.publishCurrentFile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mdToWp.publishCurrentFile",
+        "title": "Publish Current Markdown to WordPress"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "mdToWp.publishCurrentFile",
+          "when": "editorLangId == markdown",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Markdown to WordPress Post",
+      "properties": {
+        "mdToWp.siteUrl": {
+          "type": "string",
+          "default": "",
+          "description": "WordPress site URL. Example: https://example.com"
+        },
+        "mdToWp.username": {
+          "type": "string",
+          "default": "",
+          "description": "WordPress username for Application Password authentication"
+        },
+        "mdToWp.applicationPassword": {
+          "type": "string",
+          "default": "",
+          "description": "WordPress Application Password"
+        },
+        "mdToWp.defaultStatus": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "publish",
+            "private",
+            "pending"
+          ],
+          "default": "draft",
+          "description": "Default status when front matter does not define status"
+        },
+        "mdToWp.postApiPath": {
+          "type": "string",
+          "default": "/wp-json/wp/v2/posts",
+          "description": "Post API path or full URL. Example: /wp-json/wp/v2/posts"
+        },
+        "mdToWp.pageApiPath": {
+          "type": "string",
+          "default": "/wp-json/wp/v2/pages",
+          "description": "Page API path or full URL. Example: /wp-json/wp/v2/pages"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3",
+    "marked": "^13.0.2"
+  }
+}
