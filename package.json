@@ -2,7 +2,7 @@
   "name": "md-to-wordpress-post",
   "displayName": "Markdown to WordPress Post",
   "description": "Publish Markdown files with local media assets to WordPress from Cursor.",
-  "version": "1.6.9",
+  "version": "1.7.1",
   "publisher": "show-ya",
   "repository": {
     "type": "git",
@@ -72,6 +72,37 @@
           "type": "string",
           "default": "/wp-json/wp/v2/pages",
           "description": "Page API path or full URL. Example: /wp-json/wp/v2/pages"
+        },
+        "mdToWp.webhookUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Webhook URL to notify after a successful post publish"
+        },
+        "mdToWp.webhookSecret": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Webhook secret sent via X-Webhook-Secret header. Set this in user settings, not a shared workspace file"
+        },
+        "mdToWp.xPostPrefix": {
+          "type": "string",
+          "default": "",
+          "description": "Optional first line for the generated X post"
+        },
+        "mdToWp.xPostPostfix": {
+          "type": "string",
+          "default": "",
+          "description": "Optional last line for the generated X post"
+        },
+        "mdToWp.useXPro": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use the X Pro text limit (25000 characters) instead of the standard 280"
+        },
+        "mdToWp.postOnRepublish": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, send the webhook again if a published post is republished with a different publish date"
         }
       }
     }

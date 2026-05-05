@@ -30,6 +30,12 @@ type PublishConfig = {
   defaultStatus: "draft" | "publish" | "private" | "pending";
   postApiPath: string;
   pageApiPath: string;
+  webhookUrl: string;
+  webhookSecret: string;
+  xPostPrefix: string;
+  xPostPostfix: string;
+  useXPro: boolean;
+  postOnRepublish: boolean;
 };
 
 type ContentType = "post" | "page";
@@ -48,6 +54,7 @@ type UploadedMedia = {
 
 type WordPressCategory = {
   id: number;
+  name: string;
   slug: string;
 };
 
@@ -56,6 +63,55 @@ type WordPressTag = {
   name: string;
   slug: string;
 };
+
+type WordPressTerm = WordPressCategory | WordPressTag;
+
+type WordPressContentSummary = {
+  id: number;
+  type?: string;
+  status?: string;
+  date?: string;
+  link?: string;
+};
+
+type PublishResult = {
+  id: number | undefined;
+  link: string | undefined;
+  resolvedUrl: string;
+  type?: string;
+  status?: string;
+  date?: string;
+  meta?: Record<string, unknown>;
+};
+
+type PostPublishedWebhookPayload = {
+  site: string;
+  post_id: number;
+  title: string;
+  url: string;
+  tweet: string;
+  dedupe_key: string;
+  hashtags?: string;
+  meta_description?: string;
+  published_at?: string;
+};
+
+type WebhookAttemptResult =
+  | { kind: "not_applicable" }
+  | { kind: "skipped"; reason: string }
+  | { kind: "sent" }
+  | { kind: "failed"; reason: string };
+
+type ResolvedTaxonomyItem =
+  | { input: string; id: number; missing: false }
+  | { input: string; missing: true };
+
+class UserCancelledError extends Error {
+  constructor(message = "Publish cancelled.") {
+    super(message);
+    this.name = "UserCancelledError";
+  }
+}
 
 const MEDIA_EXTENSIONS = new Set([
   ".png",
@@ -171,27 +227,25 @@ export function activate(context: vscode.ExtensionContext): void {
           const parentSlug = normalizeOptionalSlugField(frontMatter.parent_slug, "parent_slug");
           const categoriesMerged = mergeListFields(rawFm.categories, rawFm.category);
           const tagsMerged = mergeListFields(rawFm.tags, rawFm.tag);
-          const categorySlugs = publishTarget.supportsTaxonomies
-            ? normalizeCategorySlugs(categoriesMerged)
+          const categoryTerms = publishTarget.supportsTaxonomies
+            ? normalizeTaxonomyTerms(categoriesMerged)
             : [];
-          const tagTerms = publishTarget.supportsTaxonomies ? normalizeTagTerms(tagsMerged) : [];
-          const categoryIds = publishTarget.supportsTaxonomies
-            ? await findCategoryIdsBySlugs(categorySlugs, config)
-            : [];
-          const tagIds =
-            publishTarget.supportsTaxonomies && tagTerms.length > 0
-              ? await findOrCreateTagIdsByTerms(tagTerms, config)
-              : [];
+          const tagTerms = publishTarget.supportsTaxonomies ? normalizeTaxonomyTerms(tagsMerged) : [];
+          progress.report({ message: "Resolving categories and tags..." });
+          const taxonomySelection = publishTarget.supportsTaxonomies
+            ? await resolveTaxonomySelection(categoryTerms, tagTerms, config)
+            : { categoryIds: [], tagIds: [] };
           const parentId =
             publishTarget.type === "page" ? await findPageParentIdBySlug(parentSlug, config) : undefined;
-          const contentId = await findContentIdBySlug(slug, publishTarget, config);
+          const existingContent = await findContentBySlug(slug, publishTarget, config);
+          const contentId = existingContent?.id ?? null;
 
           progress.report({
             message: contentId
               ? `Updating existing ${publishTarget.label.toLowerCase()}...`
               : `Creating new ${publishTarget.label.toLowerCase()}...`
           });
-          const publishedUrl = await upsertContent(
+          const publishResult = await upsertContent(
             {
               id: contentId,
               slug,
@@ -203,17 +257,34 @@ export function activate(context: vscode.ExtensionContext): void {
               metaDescription,
               focusKeyphrase,
               parentId,
-              categories: categoryIds,
-              tags: tagIds
+              categories: taxonomySelection.categoryIds,
+              tags: taxonomySelection.tagIds
             },
             publishTarget,
             config
           );
 
-          vscode.window.showInformationMessage(`Published ${publishTarget.label}: ${publishedUrl}`);
+          progress.report({ message: "Finalizing publish..." });
+          const webhookResult = await maybeSendPostPublishedWebhook(
+            {
+              publishTarget,
+              existingContent,
+              publishResult,
+              title,
+              hashtag,
+              metaDescription
+            },
+            config
+          );
+
+          await showPublishCompletionMessage(publishTarget, publishResult.resolvedUrl, webhookResult);
         }
       );
     } catch (error) {
+      if (error instanceof UserCancelledError) {
+        vscode.window.showInformationMessage(error.message);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`Publish failed: ${message}`);
     }
@@ -241,7 +312,13 @@ function loadConfig(): PublishConfig {
     ),
     defaultStatus: cfg.get("defaultStatus", "draft"),
     postApiPath: String(cfg.get("postApiPath", "/wp-json/wp/v2/posts")).trim(),
-    pageApiPath: String(cfg.get("pageApiPath", "/wp-json/wp/v2/pages")).trim()
+    pageApiPath: String(cfg.get("pageApiPath", "/wp-json/wp/v2/pages")).trim(),
+    webhookUrl: firstConfiguredString(cfg.get("webhookUrl")),
+    webhookSecret: firstConfiguredString(cfg.get("webhookSecret")),
+    xPostPrefix: firstConfiguredString(cfg.get("xPostPrefix")),
+    xPostPostfix: firstConfiguredString(cfg.get("xPostPostfix")),
+    useXPro: cfg.get("useXPro", false),
+    postOnRepublish: cfg.get("postOnRepublish", true)
   };
 }
 
@@ -449,10 +526,10 @@ function warnIgnoredFieldsForTarget(
   const ignoredFields: string[] = [];
   const categoriesMerged = mergeListFields(rawFm.categories, rawFm.category);
   const tagsMerged = mergeListFields(rawFm.tags, rawFm.tag);
-  if (!target.supportsTaxonomies && normalizeCategorySlugs(categoriesMerged).length > 0) {
+  if (!target.supportsTaxonomies && normalizeTaxonomyTerms(categoriesMerged).length > 0) {
     ignoredFields.push("categories");
   }
-  if (!target.supportsTaxonomies && normalizeTagTerms(tagsMerged).length > 0) {
+  if (!target.supportsTaxonomies && normalizeTaxonomyTerms(tagsMerged).length > 0) {
     ignoredFields.push("tags");
   }
   if (target.type === "post" && normalizeFrontMatterString(frontMatter.parent_slug)) {
@@ -496,13 +573,13 @@ function isForbiddenStatusQueryError(status: number, body: string): boolean {
   }
 }
 
-async function findContentIdBySlug(
+async function findContentBySlug(
   slug: string,
   target: PublishTarget,
   config: PublishConfig
-): Promise<number | null> {
+): Promise<WordPressContentSummary | null> {
   for (const postStatus of CONTENT_LOOKUP_STATUSES) {
-    const url = `${target.apiUrl}?slug=${encodeURIComponent(slug)}&status=${encodeURIComponent(postStatus)}&per_page=1&_fields=id,type`;
+    const url = `${target.apiUrl}?slug=${encodeURIComponent(slug)}&status=${encodeURIComponent(postStatus)}&per_page=1&_fields=id,type,status,date,link`;
     const response = await fetchLookupWithRetry(url, config);
     const text = await response.text();
     if (!response.ok) {
@@ -512,10 +589,10 @@ async function findContentIdBySlug(
       throw new Error(`${target.label} lookup failed (${response.status}): ${text}`);
     }
 
-    const data = JSON.parse(text) as Array<{ id: number; type?: string }>;
+    const data = JSON.parse(text) as WordPressContentSummary[];
     if (data.length > 0) {
       assertResponseTypeMatchesTarget(data[0].type, target);
-      return data[0].id;
+      return data[0];
     }
   }
 
@@ -574,7 +651,7 @@ async function upsertContent(
   },
   target: PublishTarget,
   config: PublishConfig
-): Promise<string> {
+): Promise<PublishResult> {
   const endpoint = input.id ? `${target.apiUrl}/${input.id}` : target.apiUrl;
 
   const payload: Record<string, unknown> = {
@@ -631,11 +708,21 @@ async function upsertContent(
     id?: number;
     link?: string;
     type?: string;
+    status?: string;
+    date?: string;
     meta?: Record<string, unknown>;
   };
   assertResponseTypeMatchesTarget(data.type, target);
   await warnIfSeoRelatedMetaRejectedByRestApi(input, data, target, config);
-  return data.link ?? `${stripTrailingSlash(config.siteUrl)}/${input.slug}`;
+  return {
+    id: data.id,
+    link: data.link,
+    resolvedUrl: data.link ?? `${stripTrailingSlash(config.siteUrl)}/${input.slug}`,
+    type: data.type,
+    status: data.status,
+    date: data.date,
+    meta: data.meta
+  };
 }
 
 function restMetaValueEquals(saved: unknown, expected: string): boolean {
@@ -888,22 +975,7 @@ function normalizeOptionalSlugField(value: unknown, fieldName: string): string |
   return normalized;
 }
 
-function normalizeCategorySlugs(value: unknown): string[] {
-  if (!value) {
-    return [];
-  }
-
-  const values = Array.isArray(value) ? value : [value];
-  const slugs = values
-    .map(item => (typeof item === "string" ? unwrapOuterQuotes(item).trim() : ""))
-    .filter(Boolean)
-    .map(normalizeSlug)
-    .filter(Boolean);
-
-  return Array.from(new Set(slugs));
-}
-
-function normalizeTagTerms(value: unknown): string[] {
+function normalizeTaxonomyTerms(value: unknown): string[] {
   if (!value) {
     return [];
   }
@@ -916,75 +988,254 @@ function normalizeTagTerms(value: unknown): string[] {
   return Array.from(new Set(terms));
 }
 
-async function findCategoryIdsBySlugs(slugs: string[], config: PublishConfig): Promise<number[]> {
-  if (slugs.length === 0) {
-    return [];
+async function resolveTaxonomySelection(
+  categoryTerms: string[],
+  tagTerms: string[],
+  config: PublishConfig
+): Promise<{ categoryIds: number[]; tagIds: number[] }> {
+  const [categoryItems, tagItems] = await Promise.all([
+    resolveExistingTerms("category", categoryTerms, config),
+    resolveExistingTerms("tag", tagTerms, config)
+  ]);
+
+  const missingCategories = categoryItems.filter(item => item.missing).map(item => item.input);
+  const missingTags = tagItems.filter(item => item.missing).map(item => item.input);
+
+  if (missingCategories.length === 0 && missingTags.length === 0) {
+    return {
+      categoryIds: categoryItems.flatMap(item => (item.missing ? [] : [item.id])),
+      tagIds: tagItems.flatMap(item => (item.missing ? [] : [item.id]))
+    };
   }
 
-  const url = `${stripTrailingSlash(config.siteUrl)}/wp-json/wp/v2/categories?slug=${encodeURIComponent(slugs.join(","))}&per_page=100&_fields=id,slug`;
+  const choice = await promptForMissingTaxonomies(missingCategories, missingTags);
+  if (choice === "cancel") {
+    throw new UserCancelledError();
+  }
+
+  if (choice === "ignore") {
+    return {
+      categoryIds: categoryItems.flatMap(item => (item.missing ? [] : [item.id])),
+      tagIds: tagItems.flatMap(item => (item.missing ? [] : [item.id]))
+    };
+  }
+
+  return {
+    categoryIds: await materializeTermIds("category", categoryItems, config),
+    tagIds: await materializeTermIds("tag", tagItems, config)
+  };
+}
+
+async function resolveExistingTerms(
+  taxonomy: "category" | "tag",
+  inputs: string[],
+  config: PublishConfig
+): Promise<ResolvedTaxonomyItem[]> {
+  const results: ResolvedTaxonomyItem[] = [];
+  for (const input of inputs) {
+    const id = await findExistingTermId(taxonomy, input, config);
+    if (id === null) {
+      results.push({ input, missing: true });
+      continue;
+    }
+    results.push({ input, id, missing: false });
+  }
+  return results;
+}
+
+async function findExistingTermId(
+  taxonomy: "category" | "tag",
+  input: string,
+  config: PublishConfig
+): Promise<number | null> {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const slugCandidate = normalizeSlug(trimmed);
+  if (slugCandidate) {
+    const bySlug = await fetchTermsBySlug(taxonomy, slugCandidate, config);
+    const exactSlugMatches = bySlug.filter(term => termSlugEquals(term.slug, trimmed));
+    if (exactSlugMatches.length > 1) {
+      throw new Error(`Ambiguous ${taxonomy} slug: ${trimmed}`);
+    }
+    if (exactSlugMatches.length === 1) {
+      return exactSlugMatches[0].id;
+    }
+  }
+
+  const bySearch = await searchTerms(taxonomy, trimmed, config);
+  const exactNameMatches = bySearch.filter(term => termNameEquals(term.name, trimmed));
+  if (exactNameMatches.length > 1) {
+    throw new Error(`Ambiguous ${taxonomy} name: ${trimmed}`);
+  }
+  if (exactNameMatches.length === 1) {
+    return exactNameMatches[0].id;
+  }
+
+  const exactSlugMatches = bySearch.filter(term => termSlugEquals(term.slug, trimmed));
+  if (exactSlugMatches.length > 1) {
+    throw new Error(`Ambiguous ${taxonomy} slug: ${trimmed}`);
+  }
+  if (exactSlugMatches.length === 1) {
+    return exactSlugMatches[0].id;
+  }
+
+  return null;
+}
+
+async function fetchTermsBySlug(
+  taxonomy: "category" | "tag",
+  slug: string,
+  config: PublishConfig
+): Promise<WordPressTerm[]> {
+  const endpoint = taxonomy === "category" ? "categories" : "tags";
+  const url = `${stripTrailingSlash(config.siteUrl)}/wp-json/wp/v2/${endpoint}?slug=${encodeURIComponent(slug)}&per_page=100&_fields=id,name,slug`;
   const response = await fetchLookupWithRetry(url, config);
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Category lookup failed (${response.status}): ${text}`);
+    throw new Error(`${taxonomy === "category" ? "Category" : "Tag"} lookup failed (${response.status}): ${text}`);
   }
-
-  const categories = (await response.json()) as WordPressCategory[];
-  const slugToId = new Map(categories.map(category => [normalizeSlug(category.slug), category.id]));
-  const missing = slugs.filter(slug => !slugToId.has(slug));
-  if (missing.length > 0) {
-    throw new Error(`Unknown category slug(s): ${missing.join(", ")}`);
-  }
-
-  return slugs.map(slug => slugToId.get(slug)!);
+  return (await response.json()) as WordPressTerm[];
 }
 
-async function findOrCreateTagIdsByTerms(terms: string[], config: PublishConfig): Promise<number[]> {
-  const unique = Array.from(new Set(terms.filter(Boolean)));
+async function searchTerms(
+  taxonomy: "category" | "tag",
+  term: string,
+  config: PublishConfig
+): Promise<WordPressTerm[]> {
+  const endpoint = taxonomy === "category" ? "categories" : "tags";
+  const url = `${stripTrailingSlash(config.siteUrl)}/wp-json/wp/v2/${endpoint}?search=${encodeURIComponent(term)}&per_page=100&_fields=id,name,slug`;
+  const response = await fetchLookupWithRetry(url, config);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${taxonomy === "category" ? "Category" : "Tag"} lookup failed (${response.status}): ${text}`);
+  }
+  return (await response.json()) as WordPressTerm[];
+}
+
+function termNameEquals(actual: string, expected: string): boolean {
+  return actual.trim() === expected.trim();
+}
+
+function termSlugEquals(actual: string, expected: string): boolean {
+  const trimmedExpected = expected.trim();
+  if (actual.trim() === trimmedExpected) {
+    return true;
+  }
+  const normalizedActual = normalizeSlug(actual);
+  const normalizedExpected = normalizeSlug(trimmedExpected);
+  return Boolean(normalizedActual) && normalizedActual === normalizedExpected;
+}
+
+async function promptForMissingTaxonomies(
+  categories: string[],
+  tags: string[]
+): Promise<"cancel" | "ignore" | "create"> {
+  const parts: string[] = [];
+  if (categories.length > 0) {
+    parts.push(`未登録カテゴリ: ${categories.join(", ")}`);
+  }
+  if (tags.length > 0) {
+    parts.push(`未登録タグ: ${tags.join(", ")}`);
+  }
+
+  const selection = await vscode.window.showWarningMessage(
+    `${parts.join("\n")}\n\n処理を選んでください。`,
+    { modal: true },
+    "中止",
+    "無視して投稿",
+    "作成して投稿"
+  );
+
+  if (selection === "無視して投稿") {
+    return "ignore";
+  }
+  if (selection === "作成して投稿") {
+    return "create";
+  }
+  return "cancel";
+}
+
+async function materializeTermIds(
+  taxonomy: "category" | "tag",
+  items: ResolvedTaxonomyItem[],
+  config: PublishConfig
+): Promise<number[]> {
   const ids: number[] = [];
-  for (const term of unique) {
-    ids.push(await findOrCreateTagIdByTerm(term, config));
+  for (const item of items) {
+    if (!item.missing) {
+      ids.push(item.id);
+      continue;
+    }
+
+    const definition = await promptForNewTerm(taxonomy, item.input);
+    ids.push(await createWordPressTerm(taxonomy, definition.name, definition.slug, config));
   }
   return ids;
 }
 
-async function findOrCreateTagIdByTerm(term: string, config: PublishConfig): Promise<number> {
-  const base = stripTrailingSlash(config.siteUrl);
-  const slug = normalizeSlug(term);
-
-  if (slug) {
-    const findUrl = `${base}/wp-json/wp/v2/tags?slug=${encodeURIComponent(slug)}&per_page=1&_fields=id,name,slug`;
-    const findResponse = await fetchLookupWithRetry(findUrl, config);
-    if (!findResponse.ok) {
-      const text = await findResponse.text();
-      throw new Error(`Tag lookup failed (${findResponse.status}): ${text}`);
-    }
-
-    const existing = (await findResponse.json()) as WordPressTag[];
-    if (existing.length > 0) {
-      return existing[0].id;
-    }
+async function promptForNewTerm(
+  taxonomy: "category" | "tag",
+  originalInput: string
+): Promise<{ name: string; slug: string }> {
+  const label = taxonomy === "category" ? "カテゴリ" : "タグ";
+  const name = await vscode.window.showInputBox({
+    title: `${label}を作成`,
+    prompt: `${originalInput} の表示名を入力してください`,
+    value: originalInput,
+    ignoreFocusOut: true,
+    validateInput: value => (value.trim() ? undefined : "表示名を入力してください。")
+  });
+  if (name === undefined) {
+    throw new UserCancelledError();
   }
 
-  const createUrl = `${base}/wp-json/wp/v2/tags`;
-  const createResponse = await fetch(createUrl, {
+  const slug = await vscode.window.showInputBox({
+    title: `${label}を作成`,
+    prompt: `${name.trim()} の slug を入力してください`,
+    value: normalizeSlug(originalInput),
+    ignoreFocusOut: true,
+    validateInput: value => (value.trim() ? undefined : "slug を入力してください。")
+  });
+  if (slug === undefined) {
+    throw new UserCancelledError();
+  }
+
+  return {
+    name: name.trim(),
+    slug: slug.trim()
+  };
+}
+
+async function createWordPressTerm(
+  taxonomy: "category" | "tag",
+  name: string,
+  slug: string,
+  config: PublishConfig
+): Promise<number> {
+  const endpoint = taxonomy === "category" ? "categories" : "tags";
+  const url = `${stripTrailingSlash(config.siteUrl)}/wp-json/wp/v2/${endpoint}`;
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: basicAuth(config.username, config.applicationPassword),
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ name: term })
+    body: JSON.stringify({ name, slug })
   });
 
-  if (!createResponse.ok) {
-    const text = await createResponse.text();
+  if (!response.ok) {
+    const text = await response.text();
     const existingId = parseExistingTermId(text);
     if (existingId !== null) {
       return existingId;
     }
-    throw new Error(`Tag create failed (${createResponse.status}): ${text}`);
+    throw new Error(`${taxonomy === "category" ? "Category" : "Tag"} create failed (${response.status}): ${text}`);
   }
 
-  const created = (await createResponse.json()) as WordPressTag;
+  const created = (await response.json()) as WordPressTerm;
   return created.id;
 }
 
@@ -1007,6 +1258,285 @@ function parseExistingTermId(raw: string): number | null {
     return null;
   } catch {
     return null;
+  }
+}
+
+async function maybeSendPostPublishedWebhook(
+  input: {
+    publishTarget: PublishTarget;
+    existingContent: WordPressContentSummary | null;
+    publishResult: PublishResult;
+    title: string;
+    hashtag: string | undefined;
+    metaDescription: string | undefined;
+  },
+  config: PublishConfig
+): Promise<WebhookAttemptResult> {
+  if (input.publishTarget.type !== "post") {
+    return { kind: "not_applicable" };
+  }
+
+  if (input.publishResult.status !== "publish") {
+    return { kind: "not_applicable" };
+  }
+
+  if (typeof input.publishResult.id !== "number" || !input.publishResult.link) {
+    return { kind: "skipped", reason: "公開 URL または投稿 ID を取得できなかったため、X 連携をスキップしました。" };
+  }
+
+  if (!shouldSendWebhookOnPublish(input.existingContent, input.publishResult, config)) {
+    return { kind: "not_applicable" };
+  }
+
+  if (!config.webhookUrl && !config.webhookSecret) {
+    return { kind: "not_applicable" };
+  }
+
+  if (!config.webhookUrl || !config.webhookSecret) {
+    return { kind: "skipped", reason: "Webhook 設定が不完全です。mdToWp.webhookUrl と mdToWp.webhookSecret の両方を設定してください。" };
+  }
+
+  const tweet = buildTweetForWebhook({
+    prefix: config.xPostPrefix,
+    title: input.title,
+    url: input.publishResult.link,
+    hashtag: input.hashtag,
+    postfix: config.xPostPostfix,
+    useXPro: config.useXPro
+  });
+  if (!tweet.ok) {
+    return { kind: "skipped", reason: tweet.reason };
+  }
+
+  const payload = buildPostPublishedWebhookPayload(
+    {
+      id: input.publishResult.id,
+      link: input.publishResult.link,
+      title: input.title,
+      hashtag: input.hashtag,
+      metaDescription: input.metaDescription,
+      publishedAt: input.publishResult.date,
+      tweet: tweet.tweet
+    },
+    config
+  );
+
+  try {
+    const response = await fetch(config.webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Webhook-Secret": config.webhookSecret
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      return { kind: "failed", reason: `X webhook failed (${response.status}): ${body}` };
+    }
+
+    return { kind: "sent" };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { kind: "failed", reason: `X webhook request failed: ${message}` };
+  }
+}
+
+function shouldSendWebhookOnPublish(
+  existingContent: WordPressContentSummary | null,
+  publishResult: PublishResult,
+  config: PublishConfig
+): boolean {
+  if (!existingContent) {
+    return true;
+  }
+
+  if (existingContent.status !== "publish") {
+    return true;
+  }
+
+  if (!config.postOnRepublish) {
+    return false;
+  }
+
+  if (!existingContent.date || !publishResult.date) {
+    return false;
+  }
+
+  return existingContent.date !== publishResult.date;
+}
+
+function buildPostPublishedWebhookPayload(
+  input: {
+    id: number;
+    link: string;
+    title: string;
+    hashtag: string | undefined;
+    metaDescription: string | undefined;
+    publishedAt: string | undefined;
+    tweet: string;
+  },
+  config: PublishConfig
+): PostPublishedWebhookPayload {
+  const site = new URL(config.siteUrl).hostname;
+  const dedupeSuffix = input.publishedAt ? encodeURIComponent(input.publishedAt) : "unknown";
+  const payload: PostPublishedWebhookPayload = {
+    site,
+    post_id: input.id,
+    title: input.title,
+    url: input.link,
+    tweet: input.tweet,
+    dedupe_key: `${site}:${input.id}:publish:${dedupeSuffix}`
+  };
+
+  if (input.hashtag) {
+    payload.hashtags = input.hashtag;
+  }
+  if (input.metaDescription) {
+    payload.meta_description = input.metaDescription;
+  }
+  if (input.publishedAt) {
+    payload.published_at = input.publishedAt;
+  }
+
+  return payload;
+}
+
+function buildTweetForWebhook(input: {
+  prefix: string;
+  title: string;
+  url: string;
+  hashtag: string | undefined;
+  postfix: string;
+  useXPro: boolean;
+}): { ok: true; tweet: string } | { ok: false; reason: string } {
+  const limit = input.useXPro ? 25000 : 280;
+  const parts = {
+    prefix: input.prefix,
+    title: input.title,
+    url: input.url,
+    hashtag: input.hashtag,
+    postfix: input.postfix
+  };
+
+  let tweet = composeTweet(parts);
+  if (measureTweetLength(tweet) <= limit) {
+    return { ok: true, tweet };
+  }
+
+  if (parts.postfix) {
+    parts.postfix = "";
+    tweet = composeTweet(parts);
+    if (measureTweetLength(tweet) <= limit) {
+      return { ok: true, tweet };
+    }
+  }
+
+  if (parts.hashtag) {
+    parts.hashtag = undefined;
+    tweet = composeTweet(parts);
+    if (measureTweetLength(tweet) <= limit) {
+      return { ok: true, tweet };
+    }
+  }
+
+  const truncatedTitle = truncateTitleToFit(parts, limit);
+  if (truncatedTitle) {
+    parts.title = truncatedTitle;
+    tweet = composeTweet(parts);
+    if (measureTweetLength(tweet) <= limit) {
+      return { ok: true, tweet };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: `X 投稿文が文字数制限 (${limit}) を超えたため、Webhook をスキップしました。`
+  };
+}
+
+function composeTweet(input: {
+  prefix: string;
+  title: string;
+  url: string;
+  hashtag: string | undefined;
+  postfix: string;
+}): string {
+  return [input.prefix, input.title, input.url, input.hashtag, input.postfix]
+    .map(value => value?.trim() ?? "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+function measureTweetLength(text: string): number {
+  const urlPattern = /https?:\/\/\S+/g;
+  let length = 0;
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(urlPattern)) {
+    const matchIndex = match.index ?? 0;
+    length += Array.from(text.slice(lastIndex, matchIndex)).length;
+    length += 23;
+    lastIndex = matchIndex + match[0].length;
+  }
+
+  length += Array.from(text.slice(lastIndex)).length;
+  return length;
+}
+
+function truncateTitleToFit(
+  input: {
+    prefix: string;
+    title: string;
+    url: string;
+    hashtag: string | undefined;
+    postfix: string;
+  },
+  limit: number
+): string | null {
+  const chars = Array.from(input.title);
+  let low = 0;
+  let high = chars.length;
+  let best: string | null = null;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = `${chars.slice(0, mid).join("").trimEnd()}…`;
+    const tweet = composeTweet({ ...input, title: candidate });
+    if (measureTweetLength(tweet) <= limit) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return best;
+}
+
+async function showPublishCompletionMessage(
+  publishTarget: PublishTarget,
+  publishedUrl: string,
+  webhookResult: WebhookAttemptResult
+): Promise<void> {
+  const openButton = "記事を開く";
+  let selection: string | undefined;
+
+  if (webhookResult.kind === "failed" || webhookResult.kind === "skipped") {
+    selection = await vscode.window.showWarningMessage(
+      `Published ${publishTarget.label}: ${publishedUrl}\n${webhookResult.reason}`,
+      openButton
+    );
+  } else {
+    selection = await vscode.window.showInformationMessage(
+      `Published ${publishTarget.label}: ${publishedUrl}`,
+      openButton
+    );
+  }
+
+  if (selection === openButton) {
+    await vscode.env.openExternal(vscode.Uri.parse(publishedUrl));
   }
 }
 

@@ -9,6 +9,7 @@ Markdown ファイルを WordPress の Post / Page として投稿する拡張�
 - 同一スラッグの Post / Page があれば新規作成せず更新する
 - Post だけでなく Page 投稿にも対応する
 - Front Matter でスラッグ、公開状態、カテゴリ、タグ、メタ情報を指定できる
+- Post の publish 成功後に Webhook を呼び、X 連携用 payload を送れる
 
 ## Markdown の解釈方針
 
@@ -41,6 +42,11 @@ Markdown の HTML 変換には `marked` を使っています。基本的な解�
 - `mdToWp.defaultStatus`（任意）
 - `mdToWp.postApiPath`（任意）
 - `mdToWp.pageApiPath`（任意）
+- `mdToWp.webhookUrl`（任意）
+- `mdToWp.xPostPrefix`（任意）
+- `mdToWp.xPostPostfix`（任意）
+- `mdToWp.useXPro`（任意、既定値 `false`）
+- `mdToWp.postOnRepublish`（任意、既定値 `true`）
 
 設定例:
 
@@ -52,10 +58,17 @@ Markdown の HTML 変換には `marked` を使っています。基本的な解�
     "mdToWp.applicationPassword": "xxxx xxxx xxxx xxxx xxxx xxxx",
     "mdToWp.defaultStatus": "draft",
     "mdToWp.postApiPath": "/wp-json/wp/v2/posts",
-    "mdToWp.pageApiPath": "/wp-json/wp/v2/pages"
+    "mdToWp.pageApiPath": "/wp-json/wp/v2/pages",
+    "mdToWp.webhookUrl": "https://hook.showya-kiss.com/post-published",
+    "mdToWp.xPostPrefix": "【新着記事】",
+    "mdToWp.xPostPostfix": "ぜひチェックしてください。",
+    "mdToWp.useXPro": false,
+    "mdToWp.postOnRepublish": true
   }
 }
 ```
+
+`mdToWp.webhookSecret` は `X-Webhook-Secret` ヘッダで送る秘密値です。共有される `.code-workspace` ではなく、User Settings に設定してください。
 
 ## 使い方
 
@@ -90,8 +103,8 @@ status: publish
 - `date` は WordPress の投稿日時として送信します
 - `language` は `meta.language` として送信します
 - `meta_description` は `meta.fit_seo_description-single` と `_yoast_wpseo_metadesc` として送信します
-- `categories` は `post` 投稿時のみ有効です。カテゴリスラッグ配列で指定し、投稿時に ID へ解決します
-- `tags` は `post` 投稿時のみ有効です。タグ名配列で指定します
+- `categories` は `post` 投稿時のみ有効です。カテゴリ名または slug の配列で指定できます
+- `tags` は `post` 投稿時のみ有効です。タグ名または slug の配列で指定できます
 - `hashtag` は `post` / `page` のどちらでも利用でき、本文先頭にそのまま挿入します
 - `hashtag` は WordPress タグへは同期せず、本文用の生文字列として扱います
 - `focus_keyphrase` は `_yoast_wpseo_focuskw` として送信します
@@ -148,6 +161,52 @@ add_action('rest_api_init', function () {
 ```
 
 同一キーがテーマや他プラグインですでに登録されている場合は、二重登録を避けてください。
+
+## カテゴリ / タグの扱い
+
+この拡張は、指定されたカテゴリやタグを最初に既存の WordPress term と照合します。照合は name 完全一致または slug 完全一致で行います。
+
+未登録のカテゴリやタグがあった場合は、投稿前に warning を表示し、次のいずれかを選べます。
+
+- `中止`
+- `無視して投稿`
+- `作成して投稿`
+
+`無視して投稿` を選んだ場合、未登録の term はその投稿から除外されます。`作成して投稿` を選んだ場合は、表示名と slug を入力して作成してから投稿します。
+
+## Webhook / X 連携
+
+Webhook は次の条件をすべて満たしたときだけ送信します。
+
+- `type: post`
+- WordPress 投稿 API が成功している
+- 最終 status が `publish`
+- 公開 URL と投稿 ID が WordPress 応答から取得できている
+- `mdToWp.webhookUrl` と `mdToWp.webhookSecret` が両方設定されている
+
+Webhook 送信先には JSON を `POST` し、認証は `X-Webhook-Secret` ヘッダで行います。secret は JSON 本文に含めません。
+
+X 投稿文は VSIX 側で生成します。並び順は次のとおりです。
+
+- `mdToWp.xPostPrefix`
+- 記事タイトル
+- 公開 URL
+- front matter の `hashtag`
+- `mdToWp.xPostPostfix`
+
+空文字の要素は除外し、残った要素を改行で連結します。
+
+文字数制限を超える場合は、次の順で削ります。
+
+1. `xPostPostfix`
+2. `hashtag`
+3. `title`
+
+それでも収まらない場合、WordPress 投稿は成功のままにして Webhook は送らず warning を表示します。
+
+`mdToWp.useXPro` が `false` のときは 280 文字、`true` のときは 25000 文字として扱います。
+
+`mdToWp.postOnRepublish` が `true` のときは、すでに publish 済みの記事でも、投稿日が変わった再 publish で再度 Webhook を送ります。
 
 ## 独自記法
 
