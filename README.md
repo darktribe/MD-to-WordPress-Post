@@ -8,7 +8,7 @@ Markdown ファイルを WordPress の Post / Page として投稿する拡張�
 - Markdown 内のローカルメディア参照を WordPress にアップロードして URL を差し替える
 - 同一スラッグの Post / Page があれば新規作成せず更新する
 - Post だけでなく Page 投稿にも対応する
-- Front Matter でスラッグ、公開状態、カテゴリ、タグ、メタ情報を指定できる
+- Front Matter でスラッグ、公開状態、カテゴリ、タグ、メタ情報、アイキャッチ画像を指定できる
 - Post の publish 成功後に Webhook を呼び、X 連携用 payload を送れる
 
 ## Markdown の解釈方針
@@ -91,6 +91,7 @@ tags: ["BenQ", "Gadget", "Review"]
 hashtag: "#BenQ #ScreenBar #Halo2 #Gadget #ガジェット #レビュー"
 focus_keyphrase: "BenQ Screen Bar Halo 2 レビュー"
 meta_description: "BenQのモニターライトHalo2は値段に見合った満足を与えてくれる名品です。"
+image: "BenQ-Halo2.jpg"
 status: publish
 ---
 ```
@@ -108,6 +109,9 @@ status: publish
 - `hashtag` は `post` / `page` のどちらでも利用でき、本文先頭にそのまま挿入します
 - `hashtag` は WordPress タグへは同期せず、本文用の生文字列として扱います
 - `focus_keyphrase` は `_yoast_wpseo_focuskw` として送信します
+- `image`（または `images`）はアイキャッチ画像のファイル名です。Markdown と同じディレクトリ直下の `img/` 内を探し、見つかった画像を WordPress にアップロードして `featured_media` に設定します
+- `image` に拡張子がない場合は `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.svg`、`.avif` の順で候補を探します
+- `img/` 内に該当ファイルがない場合はアイキャッチを設定せず、投稿処理は続行します
 
 Page 投稿例:
 

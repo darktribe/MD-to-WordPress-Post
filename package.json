@@ -2,7 +2,7 @@
   "name": "md-to-wordpress-post",
   "displayName": "Markdown to WordPress Post",
   "description": "Publish Markdown files with local media assets to WordPress from Cursor.",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "publisher": "show-ya",
   "repository": {
     "type": "git",

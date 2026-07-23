@@ -21,6 +21,10 @@ type FrontMatter = {
   meta_description?: string;
   hashtag?: string;
   focus_keyphrase?: string;
+  /** アイキャッチ画像（`img/` 内のファイル名。`images` も同義） */
+  image?: string;
+  /** @deprecated use `image` */
+  images?: string;
 };
 
 type PublishConfig = {
@@ -49,6 +53,7 @@ type PublishTarget = {
 };
 
 type UploadedMedia = {
+  id: number;
   source_url: string;
 };
 
@@ -134,6 +139,8 @@ const MEDIA_EXTENSIONS = new Set([
 
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
 
+const FEATURED_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"] as const;
+
 const YOAST_FOCUS_META_KEY = "_yoast_wpseo_focuskw";
 const YOAST_METADESC_META_KEY = "_yoast_wpseo_metadesc";
 /** FIT テーマ GOLDBLOG / GOLDMEDIA の記事メタディスクリプション */
@@ -193,11 +200,23 @@ export function activate(context: vscode.ExtensionContext): void {
           const publishTarget = resolvePublishTarget(contentType, config);
           warnIgnoredFieldsForTarget(frontMatter, rawFm, publishTarget);
 
+          const markdownDir = path.dirname(doc.uri.fsPath);
+          const mediaCache = new Map<string, UploadedMedia>();
+
+          progress.report({ message: "Uploading featured image..." });
+          const featuredMediaId = await resolveFeaturedImageMediaId(
+            rawFm,
+            markdownDir,
+            config,
+            mediaCache
+          );
+
           progress.report({ message: "Uploading local media files..." });
           const replacedMarkdown = await replaceLocalMediaLinks(
             parsed.content,
-            path.dirname(doc.uri.fsPath),
-            config
+            markdownDir,
+            config,
+            mediaCache
           );
 
           const hashtag = normalizeFrontMatterString(frontMatter.hashtag);
@@ -258,7 +277,8 @@ export function activate(context: vscode.ExtensionContext): void {
               focusKeyphrase,
               parentId,
               categories: taxonomySelection.categoryIds,
-              tags: taxonomySelection.tagIds
+              tags: taxonomySelection.tagIds,
+              featuredMediaId
             },
             publishTarget,
             config
@@ -346,9 +366,9 @@ function validateConfig(config: PublishConfig): void {
 async function replaceLocalMediaLinks(
   markdown: string,
   markdownDir: string,
-  config: PublishConfig
+  config: PublishConfig,
+  cache: Map<string, UploadedMedia>
 ): Promise<string> {
-  const cache = new Map<string, string>();
   let output = markdown;
 
   const markdownUrlPattern = /(!?\[[^\]]*?\]\()([^)]+)(\))/g;
@@ -359,8 +379,8 @@ async function replaceLocalMediaLinks(
       continue;
     }
 
-    const mediaUrl = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
-    output = replaceExactUrl(output, originalUrl, mediaUrl);
+    const uploaded = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
+    output = replaceExactUrl(output, originalUrl, uploaded.source_url);
   }
 
   const htmlSrcPattern = /(src=["'])([^"']+)(["'])/g;
@@ -371,8 +391,8 @@ async function replaceLocalMediaLinks(
       continue;
     }
 
-    const mediaUrl = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
-    output = replaceExactUrl(output, originalUrl, mediaUrl);
+    const uploaded = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
+    output = replaceExactUrl(output, originalUrl, uploaded.source_url);
   }
 
   return output;
@@ -382,21 +402,91 @@ async function resolveAndUploadMedia(
   rawUrl: string,
   markdownDir: string,
   config: PublishConfig,
-  cache: Map<string, string>
-): Promise<string> {
+  cache: Map<string, UploadedMedia>
+): Promise<UploadedMedia> {
   const localPath = resolvePathFromMarkdown(rawUrl, markdownDir);
   const ext = path.extname(localPath).toLowerCase();
   if (!MEDIA_EXTENSIONS.has(ext)) {
     throw new Error(`Only media files are allowed as local references. Unsupported: ${rawUrl}`);
   }
 
+  return uploadMediaCached(localPath, config, cache);
+}
+
+async function uploadMediaCached(
+  localPath: string,
+  config: PublishConfig,
+  cache: Map<string, UploadedMedia>
+): Promise<UploadedMedia> {
   if (cache.has(localPath)) {
     return cache.get(localPath)!;
   }
 
-  const sourceUrl = await uploadMedia(localPath, config);
-  cache.set(localPath, sourceUrl);
-  return sourceUrl;
+  const uploaded = await uploadMedia(localPath, config);
+  cache.set(localPath, uploaded);
+  return uploaded;
+}
+
+function normalizeFeaturedImageField(rawFm: Record<string, unknown>): string | undefined {
+  return normalizeFrontMatterString(rawFm.image) ?? normalizeFrontMatterString(rawFm.images);
+}
+
+async function resolveFeaturedImageMediaId(
+  rawFm: Record<string, unknown>,
+  markdownDir: string,
+  config: PublishConfig,
+  cache: Map<string, UploadedMedia>
+): Promise<number | undefined> {
+  const fileRef = normalizeFeaturedImageField(rawFm);
+  if (!fileRef) {
+    return undefined;
+  }
+
+  const localPath = await findFeaturedImagePath(markdownDir, fileRef);
+  if (!localPath) {
+    return undefined;
+  }
+
+  const uploaded = await uploadMediaCached(localPath, config, cache);
+  return uploaded.id;
+}
+
+async function findFeaturedImagePath(markdownDir: string, fileRef: string): Promise<string | undefined> {
+  const trimmed = fileRef.trim();
+  const baseName = path.basename(trimmed);
+  if (!baseName || baseName !== trimmed) {
+    throw new Error(`Invalid front matter image: ${fileRef}`);
+  }
+
+  const imgDir = path.join(markdownDir, "img");
+  const ext = path.extname(baseName).toLowerCase();
+  if (ext) {
+    if (!FEATURED_IMAGE_EXTENSIONS.includes(ext as (typeof FEATURED_IMAGE_EXTENSIONS)[number])) {
+      throw new Error(
+        `Featured image must be an image file (${FEATURED_IMAGE_EXTENSIONS.join(", ")}): ${fileRef}`
+      );
+    }
+    const candidate = path.join(imgDir, baseName);
+    return (await fileExists(candidate)) ? candidate : undefined;
+  }
+
+  for (const candidateExt of FEATURED_IMAGE_EXTENSIONS) {
+    const candidate = path.join(imgDir, `${baseName}${candidateExt}`);
+    if (await fileExists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function resolvePathFromMarkdown(rawUrl: string, markdownDir: string): string {
@@ -418,7 +508,7 @@ function replaceExactUrl(markdown: string, from: string, to: string): string {
   return markdown.split(from).join(to);
 }
 
-async function uploadMedia(localPath: string, config: PublishConfig): Promise<string> {
+async function uploadMedia(localPath: string, config: PublishConfig): Promise<UploadedMedia> {
   const fileName = path.basename(localPath);
   const fileBuffer = await fs.readFile(localPath);
   const contentType = detectContentType(fileName);
@@ -438,12 +528,12 @@ async function uploadMedia(localPath: string, config: PublishConfig): Promise<st
     throw new Error(`Media upload failed (${response.status}): ${text}`);
   }
 
-  const data = (await response.json()) as UploadedMedia;
-  if (!data.source_url) {
-    throw new Error(`Media upload succeeded but source_url is missing: ${fileName}`);
+  const data = (await response.json()) as { id?: number; source_url?: string };
+  if (typeof data.id !== "number" || !data.source_url) {
+    throw new Error(`Media upload succeeded but id or source_url is missing: ${fileName}`);
   }
 
-  return data.source_url;
+  return { id: data.id, source_url: data.source_url };
 }
 
 function detectContentType(fileName: string): string {
@@ -648,6 +738,7 @@ async function upsertContent(
     parentId: number | undefined;
     categories: number[];
     tags: number[];
+    featuredMediaId: number | undefined;
   },
   target: PublishTarget,
   config: PublishConfig
@@ -688,6 +779,9 @@ async function upsertContent(
   }
   if (input.tags.length > 0) {
     payload.tags = input.tags;
+  }
+  if (typeof input.featuredMediaId === "number") {
+    payload.featured_media = input.featuredMediaId;
   }
 
   const response = await fetch(endpoint, {

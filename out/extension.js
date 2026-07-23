@@ -68,6 +68,7 @@ const MEDIA_EXTENSIONS = new Set([
     ".zip"
 ]);
 const MARKDOWN_EXTENSIONS = new Set([".md", ".markdown"]);
+const FEATURED_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"];
 const YOAST_FOCUS_META_KEY = "_yoast_wpseo_focuskw";
 const YOAST_METADESC_META_KEY = "_yoast_wpseo_metadesc";
 /** FIT テーマ GOLDBLOG / GOLDMEDIA の記事メタディスクリプション */
@@ -118,8 +119,12 @@ function activate(context) {
                 const contentType = normalizeContentType(frontMatter.type);
                 const publishTarget = resolvePublishTarget(contentType, config);
                 warnIgnoredFieldsForTarget(frontMatter, rawFm, publishTarget);
+                const markdownDir = path.dirname(doc.uri.fsPath);
+                const mediaCache = new Map();
+                progress.report({ message: "Uploading featured image..." });
+                const featuredMediaId = await resolveFeaturedImageMediaId(rawFm, markdownDir, config, mediaCache);
                 progress.report({ message: "Uploading local media files..." });
-                const replacedMarkdown = await replaceLocalMediaLinks(parsed.content, path.dirname(doc.uri.fsPath), config);
+                const replacedMarkdown = await replaceLocalMediaLinks(parsed.content, markdownDir, config, mediaCache);
                 const hashtag = normalizeFrontMatterString(frontMatter.hashtag);
                 const markdownWithHashtag = hashtag ? `${hashtag}\n\n${replacedMarkdown}` : replacedMarkdown;
                 progress.report({ message: "Converting Markdown to HTML..." });
@@ -170,7 +175,8 @@ function activate(context) {
                     focusKeyphrase,
                     parentId,
                     categories: taxonomySelection.categoryIds,
-                    tags: taxonomySelection.tagIds
+                    tags: taxonomySelection.tagIds,
+                    featuredMediaId
                 }, publishTarget, config);
                 progress.report({ message: "Finalizing publish..." });
                 const webhookResult = await maybeSendPostPublishedWebhook({
@@ -232,8 +238,7 @@ function validateConfig(config) {
         throw new Error("Configure mdToWp.postApiPath and mdToWp.pageApiPath.");
     }
 }
-async function replaceLocalMediaLinks(markdown, markdownDir, config) {
-    const cache = new Map();
+async function replaceLocalMediaLinks(markdown, markdownDir, config, cache) {
     let output = markdown;
     const markdownUrlPattern = /(!?\[[^\]]*?\]\()([^)]+)(\))/g;
     const markdownMatches = Array.from(output.matchAll(markdownUrlPattern));
@@ -242,8 +247,8 @@ async function replaceLocalMediaLinks(markdown, markdownDir, config) {
         if (shouldIgnoreUrl(originalUrl)) {
             continue;
         }
-        const mediaUrl = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
-        output = replaceExactUrl(output, originalUrl, mediaUrl);
+        const uploaded = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
+        output = replaceExactUrl(output, originalUrl, uploaded.source_url);
     }
     const htmlSrcPattern = /(src=["'])([^"']+)(["'])/g;
     const htmlMatches = Array.from(output.matchAll(htmlSrcPattern));
@@ -252,8 +257,8 @@ async function replaceLocalMediaLinks(markdown, markdownDir, config) {
         if (shouldIgnoreUrl(originalUrl)) {
             continue;
         }
-        const mediaUrl = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
-        output = replaceExactUrl(output, originalUrl, mediaUrl);
+        const uploaded = await resolveAndUploadMedia(originalUrl, markdownDir, config, cache);
+        output = replaceExactUrl(output, originalUrl, uploaded.source_url);
     }
     return output;
 }
@@ -263,12 +268,62 @@ async function resolveAndUploadMedia(rawUrl, markdownDir, config, cache) {
     if (!MEDIA_EXTENSIONS.has(ext)) {
         throw new Error(`Only media files are allowed as local references. Unsupported: ${rawUrl}`);
     }
+    return uploadMediaCached(localPath, config, cache);
+}
+async function uploadMediaCached(localPath, config, cache) {
     if (cache.has(localPath)) {
         return cache.get(localPath);
     }
-    const sourceUrl = await uploadMedia(localPath, config);
-    cache.set(localPath, sourceUrl);
-    return sourceUrl;
+    const uploaded = await uploadMedia(localPath, config);
+    cache.set(localPath, uploaded);
+    return uploaded;
+}
+function normalizeFeaturedImageField(rawFm) {
+    return normalizeFrontMatterString(rawFm.image) ?? normalizeFrontMatterString(rawFm.images);
+}
+async function resolveFeaturedImageMediaId(rawFm, markdownDir, config, cache) {
+    const fileRef = normalizeFeaturedImageField(rawFm);
+    if (!fileRef) {
+        return undefined;
+    }
+    const localPath = await findFeaturedImagePath(markdownDir, fileRef);
+    if (!localPath) {
+        return undefined;
+    }
+    const uploaded = await uploadMediaCached(localPath, config, cache);
+    return uploaded.id;
+}
+async function findFeaturedImagePath(markdownDir, fileRef) {
+    const trimmed = fileRef.trim();
+    const baseName = path.basename(trimmed);
+    if (!baseName || baseName !== trimmed) {
+        throw new Error(`Invalid front matter image: ${fileRef}`);
+    }
+    const imgDir = path.join(markdownDir, "img");
+    const ext = path.extname(baseName).toLowerCase();
+    if (ext) {
+        if (!FEATURED_IMAGE_EXTENSIONS.includes(ext)) {
+            throw new Error(`Featured image must be an image file (${FEATURED_IMAGE_EXTENSIONS.join(", ")}): ${fileRef}`);
+        }
+        const candidate = path.join(imgDir, baseName);
+        return (await fileExists(candidate)) ? candidate : undefined;
+    }
+    for (const candidateExt of FEATURED_IMAGE_EXTENSIONS) {
+        const candidate = path.join(imgDir, `${baseName}${candidateExt}`);
+        if (await fileExists(candidate)) {
+            return candidate;
+        }
+    }
+    return undefined;
+}
+async function fileExists(filePath) {
+    try {
+        await fs.access(filePath);
+        return true;
+    }
+    catch {
+        return false;
+    }
 }
 function resolvePathFromMarkdown(rawUrl, markdownDir) {
     const cleanUrl = rawUrl.split("#")[0].split("?")[0];
@@ -302,10 +357,10 @@ async function uploadMedia(localPath, config) {
         throw new Error(`Media upload failed (${response.status}): ${text}`);
     }
     const data = (await response.json());
-    if (!data.source_url) {
-        throw new Error(`Media upload succeeded but source_url is missing: ${fileName}`);
+    if (typeof data.id !== "number" || !data.source_url) {
+        throw new Error(`Media upload succeeded but id or source_url is missing: ${fileName}`);
     }
-    return data.source_url;
+    return { id: data.id, source_url: data.source_url };
 }
 function detectContentType(fileName) {
     const ext = path.extname(fileName).toLowerCase();
@@ -493,6 +548,9 @@ async function upsertContent(input, target, config) {
     }
     if (input.tags.length > 0) {
         payload.tags = input.tags;
+    }
+    if (typeof input.featuredMediaId === "number") {
+        payload.featured_media = input.featuredMediaId;
     }
     const response = await fetch(endpoint, {
         method: "POST",
