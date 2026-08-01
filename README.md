@@ -251,3 +251,15 @@ X 投稿文は VSIX 側で生成します。並び順は次のとおりです。
 - Markdown リンク / 画像のローカルパス、`<img src="...">` を扱います
 - メディア拡張子以外のローカル参照はエラーにします
 - `http(s)://`、`data:`、`#` 参照はそのまま維持します
+
+### 公開前の画像選定・配置計画
+
+この拡張は、Markdown 内で参照しているローカルメディアを WordPress に
+アップロードし、本文中の参照を公開用 URL に置き換えるところを担当します。
+
+記事のどの見出しにどの画像を置くか、alt text や caption をどう確認するか、
+画像の出典やライセンスをどう残すかを投稿前に計画したい場合は、
+[Pictovap](https://github.com/yoldaolmak/Pictovap) のような外部ワークフローを
+併用できます。Pictovap は Markdown 記事から画像配置計画と editor report を
+作り、WordPress/Gutenberg 向けの確認ステップを追加するための CLI-first
+framework です。
